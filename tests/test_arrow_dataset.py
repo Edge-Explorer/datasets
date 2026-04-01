@@ -24,6 +24,7 @@ from fsspec.core import strip_protocol
 from packaging import version
 
 import datasets.arrow_dataset
+import datasets.config
 from datasets import concatenate_datasets, interleave_datasets, load_from_disk
 from datasets.arrow_dataset import Dataset, transmit_format, update_metadata_with_features
 from datasets.dataset_dict import DatasetDict
@@ -33,6 +34,7 @@ from datasets.features import (
     ClassLabel,
     Features,
     Image,
+    Json,
     LargeList,
     List,
     Translation,
@@ -118,6 +120,8 @@ def assert_arrow_metadata_are_synced_with_dataset_features(dataset: Dataset):
 IN_MEMORY_PARAMETERS = [
     {"testcase_name": name, "in_memory": im} for im, name in [(True, "in_memory"), (False, "on_disk")]
 ]
+
+STRING_FROM_PANDAS = "large_string" if datasets.config.PANDAS_VERSION.major >= 3 else "string"
 
 
 @parameterized.named_parameters(IN_MEMORY_PARAMETERS)
@@ -1440,21 +1444,13 @@ class BaseDatasetTest(TestCase):
             self._caplog.clear()
             with self._caplog.at_level(INFO, logger=get_logger().name):
                 with self._create_dummy_dataset(in_memory, tmp_dir) as dset:
-                    with patch(
-                        "datasets.arrow_dataset.Pool",
-                        new_callable=PickableMagicMock,
-                        side_effect=datasets.arrow_dataset.Pool,
-                    ) as mock_pool:
-                        with dset.map(lambda x: {"foo": "bar"}, num_proc=2) as dset_test1:
-                            dset_test1_data_files = list(dset_test1.cache_files)
-                        self.assertEqual(mock_pool.call_count, 1)
-                        with dset.map(lambda x: {"foo": "bar"}, num_proc=2) as dset_test2:
-                            self.assertEqual(dset_test1_data_files, dset_test2.cache_files)
-                            self.assertTrue(
-                                (len(re.findall("Loading cached processed dataset", self._caplog.text)) == 1)
-                                ^ in_memory
-                            )
-                        self.assertEqual(mock_pool.call_count, 2 if in_memory else 1)
+                    with dset.map(lambda x: {"foo": "bar"}, num_proc=2) as dset_test1:
+                        dset_test1_data_files = list(dset_test1.cache_files)
+                    with dset.map(lambda x: {"foo": "bar"}, num_proc=2) as dset_test2:
+                        self.assertEqual(dset_test1_data_files, dset_test2.cache_files)
+                        self.assertTrue(
+                            (len(re.findall("Loading cached processed dataset", self._caplog.text)) == 1) ^ in_memory
+                        )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             self._caplog.clear()
@@ -1656,7 +1652,7 @@ class BaseDatasetTest(TestCase):
                     self.assertEqual(len(dset_test), 30)
                     self.assertDictEqual(
                         dset_test.features,
-                        Features({"id": Value("int64"), "text": Value("string")}),
+                        Features({"id": Value("int64"), "text": Value(STRING_FROM_PANDAS)}),
                     )
                     self.assertEqual(dset_test[0]["id"], 0)
                     self.assertEqual(dset_test[0]["text"], "a")
@@ -1672,7 +1668,7 @@ class BaseDatasetTest(TestCase):
                     self.assertEqual(len(dset_test), 30)
                     self.assertDictEqual(
                         dset_test.features,
-                        Features({"id": Value("int64"), "text": Value("string")}),
+                        Features({"id": Value("int64"), "text": Value(STRING_FROM_PANDAS)}),
                     )
                     self.assertEqual(dset_test[0]["id"], 0)
                     self.assertEqual(dset_test[0]["text"], "a")
@@ -1906,6 +1902,21 @@ class BaseDatasetTest(TestCase):
                     "To debug the error, disable multiprocessing."
                 )
 
+    def test_map_on_mixed_types(self, in_memory):
+        mixed_data = {
+            "mixed_type": [-1, 1, "foo"],
+            "mix_struct_and_non_struct": [{"a": 0}, [0]],
+            "mixed_dict_keys": [{"a": 0}, {"b": 0}, {"c": 0}],
+            "mixed_dict_keys2": [[{"a": 0}, {"b": 0}], [{"c": 0}, {"d": 0}]],
+            "messages": _messages,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._create_dummy_dataset(in_memory, tmp_dir) as dset:
+                with dset.map(
+                    lambda x: mixed_data, on_mixed_types="use_json", remove_columns=dset.column_names
+                ) as dset:
+                    self.assertDictEqual(dset[0], mixed_data)
+
     def test_filter(self, in_memory):
         # keep only first five examples
 
@@ -1923,7 +1934,7 @@ class BaseDatasetTest(TestCase):
             with self._create_dummy_dataset(in_memory, tmp_dir) as dset:
                 dset.set_format("numpy")
                 fingerprint = dset._fingerprint
-                with dset.filter(lambda x: (int(x["filename"][-1]) % 2 == 0)) as dset_filter_even_num:
+                with dset.filter(lambda x: int(x["filename"][-1]) % 2 == 0) as dset_filter_even_num:
                     self.assertEqual(len(dset_filter_even_num), 15)
                     self.assertDictEqual(dset.features, Features({"filename": Value("string")}))
                     self.assertDictEqual(dset_filter_even_num.features, Features({"filename": Value("string")}))
@@ -2702,6 +2713,12 @@ class BaseDatasetTest(TestCase):
                 self.assertListEqual(list(sql_dset.columns), list(dset.column_names))
 
             # With array features
+            if datasets.config.PANDAS_VERSION.major >= 3:
+                # Pandas 3 can't save and reload string data
+                # pandas/_libs/lib.pyx:732: in pandas._libs.lib.ensure_string_array
+                # E   UnicodeDecodeError: 'utf-8' codec can't decode byte 0x98 in position 0: invalid start byte
+                # pandas/_libs/lib.pyx:846: UnicodeDecodeError
+                return
             with self._create_dummy_dataset(in_memory, tmp_dir, array_features=True) as dset:
                 file_path = os.path.join(tmp_dir, "test_path.sqlite")
                 _ = dset.to_sql("data", "sqlite:///" + file_path, if_exists="replace")
@@ -3277,6 +3294,32 @@ class BaseDatasetTest(TestCase):
         del tf_dataset_with_drop
 
 
+_messages = [
+    {"role": "user", "content": "Turn on the living room lights and play my electronic music playlist."},
+    {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {"name": "control_light", "arguments": {"room": "living room", "state": "on"}},
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "play_music",
+                    "arguments": {
+                        "playlist": "electronic"
+                    },  # mixed-type here since keys ["playlist"] and ["room", "state"] are different
+                },
+            },
+        ],
+    },
+    {"role": "tool", "name": "control_light", "content": "The lights in the living room are now on."},
+    {"role": "tool", "name": "play_music", "content": "The music is now playing."},
+    {"role": "assistant", "content": "Done!"},
+]
+
+
 class MiscellaneousDatasetTest(TestCase):
     def test_from_pandas(self):
         data = {"col_1": [3, 2, 1, 0], "col_2": ["a", "b", "c", "d"]}
@@ -3285,7 +3328,9 @@ class MiscellaneousDatasetTest(TestCase):
             self.assertSequenceEqual(dset["col_1"], data["col_1"])
             self.assertSequenceEqual(dset["col_2"], data["col_2"])
             self.assertListEqual(list(dset.features.keys()), ["col_1", "col_2"])
-            self.assertDictEqual(dset.features, Features({"col_1": Value("int64"), "col_2": Value("string")}))
+            self.assertDictEqual(
+                dset.features, Features({"col_1": Value("int64"), "col_2": Value(STRING_FROM_PANDAS)})
+            )
 
         features = Features({"col_1": Value("int64"), "col_2": Value("string")})
         with Dataset.from_pandas(df, features=features) as dset:
@@ -3377,6 +3422,27 @@ class MiscellaneousDatasetTest(TestCase):
 
         features = Features({"col_1": Value("int64"), "col_2": Value("int64"), "col_3": Value("bool")})
         self.assertRaises(ValueError, Dataset.from_dict, data, features=features)
+
+    def test_from_dict_on_mixed_types(self):
+        data = {"col_1": [-1, 1, "foo"]}
+        with Dataset.from_dict(data, on_mixed_types="use_json") as dset:
+            self.assertEqual(dset[:], data)
+        data = {"col_1": [{"a": 0}, [0]]}
+        with Dataset.from_dict(data, on_mixed_types="use_json") as dset:
+            self.assertEqual(dset[:], data)
+        data = {"col_1": [{"a": 0}, {"b": 0}, {"c": 0}]}
+        with Dataset.from_dict(data, on_mixed_types="use_json") as dset:
+            self.assertEqual(dset[:], data)
+        data = {"col_1": [[{"a": 0}, {"b": 0}], [{"c": 0}, {"d": 0}]]}
+        with Dataset.from_dict(data, on_mixed_types="use_json") as dset:
+            self.assertEqual(dset[:], data)
+        data = {"messages": [_messages]}
+        with Dataset.from_dict(data, on_mixed_types="use_json") as dset:
+            self.assertEqual(dset[:], data)
+        data = {"empty_struct": [{}]}
+        with Dataset.from_dict(data, on_mixed_types="use_json") as dset:
+            self.assertEqual(dset[:], data)
+            self.assertEqual(dset.features["empty_struct"], Json())
 
     def test_concatenate_mixed_memory_and_disk(self):
         data1, data2, data3 = {"id": [0, 1, 2]}, {"id": [3, 4, 5]}, {"id": [6, 7]}
@@ -4200,7 +4266,7 @@ def _check_sql_dataset(dataset, expected_features):
 @pytest.mark.parametrize("con_type", ["string", "engine"])
 def test_dataset_from_sql_con_type(con_type, sqlite_path, tmp_path, set_sqlalchemy_silence_uber_warning, caplog):
     cache_dir = tmp_path / "cache"
-    expected_features = {"col_1": "string", "col_2": "int64", "col_3": "float64"}
+    expected_features = {"col_1": STRING_FROM_PANDAS, "col_2": "int64", "col_3": "float64"}
     if con_type == "string":
         con = "sqlite:///" + sqlite_path
     elif con_type == "engine":
@@ -4238,7 +4304,7 @@ def test_dataset_from_sql_con_type(con_type, sqlite_path, tmp_path, set_sqlalche
 )
 def test_dataset_from_sql_features(features, sqlite_path, tmp_path, set_sqlalchemy_silence_uber_warning):
     cache_dir = tmp_path / "cache"
-    default_expected_features = {"col_1": "string", "col_2": "int64", "col_3": "float64"}
+    default_expected_features = {"col_1": STRING_FROM_PANDAS, "col_2": "int64", "col_3": "float64"}
     expected_features = features.copy() if features else default_expected_features
     features = (
         Features({feature: Value(dtype) for feature, dtype in features.items()}) if features is not None else None
@@ -4251,7 +4317,7 @@ def test_dataset_from_sql_features(features, sqlite_path, tmp_path, set_sqlalche
 @pytest.mark.parametrize("keep_in_memory", [False, True])
 def test_dataset_from_sql_keep_in_memory(keep_in_memory, sqlite_path, tmp_path, set_sqlalchemy_silence_uber_warning):
     cache_dir = tmp_path / "cache"
-    expected_features = {"col_1": "string", "col_2": "int64", "col_3": "float64"}
+    expected_features = {"col_1": STRING_FROM_PANDAS, "col_2": "int64", "col_3": "float64"}
     with assert_arrow_memory_increases() if keep_in_memory else assert_arrow_memory_doesnt_increase():
         dataset = Dataset.from_sql(
             "dataset", "sqlite:///" + sqlite_path, cache_dir=cache_dir, keep_in_memory=keep_in_memory
